@@ -6,6 +6,7 @@ from sklearn.linear_model import LogisticRegression
 import requests
 from streamlit import column_config
 import streamlit.components.v1 as components
+import math
 
 
 # ISO country flags (emoji)
@@ -33,6 +34,11 @@ CIRCUIT_FLAGS = {
     "United States": "🇺🇸", "USA": "🇺🇸",
     "Abu Dhabi": "🇦🇪", "UAE": "🇦🇪", "United Arab Emirates": "🇦🇪",
 }
+
+FETCH_LABEL = "Fetch latest qualifying (OpenF1)"
+OPENF1_BASE = "https://api.openf1.org/v1"
+
+
 
 st.set_page_config(page_title="F1 Winner Predictor", page_icon="🏁", layout="centered")
 
@@ -222,6 +228,191 @@ def build_season_circuit_index():
             })
         idx[int(season)] = items
     return idx
+
+def _pick_value(d, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+def _best_driver_name(rec):
+    # Prefer full/canonical names when OpenF1 provides them
+    name = _pick_value(rec, "driver_name", "broadcast_name")
+    if not name:
+        first = _pick_value(rec, "first_name", default="")
+        last  = _pick_value(rec, "last_name", default="")
+        name = f"{first} {last}".strip()
+    return name or None
+
+def fetch_quali_openf1(season: int, round_num: int) -> pd.DataFrame:
+    """
+    Return DataFrame: driver (full name), code (3-letter), grid_quali, grid
+    """
+    try:
+        # 1) Season+Round -> meeting_key
+        m_resp = requests.get(f"{OPENF1_BASE}/meetings", params={"year": season}, timeout=25)
+        m_resp.raise_for_status()
+        meetings = m_resp.json()
+        mtg = next((m for m in meetings if str(_pick_value(m, "round")) == str(round_num)), None)
+        if not mtg:
+            return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
+        meeting_key = _pick_value(mtg, "meeting_key", "key")
+
+        # 2) Sessions for meeting -> pick Qualifying (or Sprint Shootout) and Race
+        s_resp = requests.get(f"{OPENF1_BASE}/sessions", params={"meeting_key": meeting_key}, timeout=25)
+        s_resp.raise_for_status()
+        sessions = s_resp.json()
+
+        def _is_quali(s):
+            name = str(_pick_value(s, "session_name", "name", default="")).lower()
+            typ  = str(_pick_value(s, "session_type", "type", default="")).lower()
+            return ("qualifying" in name) or ("qualifying" in typ) or ("sprint shootout" in name) or ("sprint_shootout" in typ)
+
+        quali = next((s for s in sessions if _is_quali(s)), None)
+        race  = next((s for s in sessions if str(_pick_value(s, "session_name", "name", default="")).lower() == "race"), None)
+        if not quali:
+            return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
+
+        quali_key = _pick_value(quali, "session_key", "key")
+
+        # 3) Pull QUALI classification
+        q_resp = requests.get(f"{OPENF1_BASE}/session_result", params={"session_key": quali_key}, timeout=25)
+        q_resp.raise_for_status()
+        qres = q_resp.json()
+
+        # 3a) Get driver dictionary for this session to map numbers -> names/codes
+        d_resp = requests.get(f"{OPENF1_BASE}/drivers", params={"session_key": quali_key}, timeout=25)
+        drivers = {}
+        three_letter = {}
+        try:
+            d_resp.raise_for_status()
+            djson = d_resp.json()
+            for d in djson:
+                num = str(_pick_value(d, "driver_number"))
+                if not num or num == "None":
+                    continue
+                drivers[num] = _best_driver_name(d)
+                three_letter[num] = _pick_value(d, "three_letter_name")
+        except Exception:
+            pass  # fall back if /drivers not available
+
+        rows = []
+        for r in qres:
+            qpos = _pick_value(r, "position", "classification_position", "final_position")
+            try:
+                qpos = int(qpos) if qpos is not None and not (isinstance(qpos, float) and math.isnan(qpos)) else None
+            except Exception:
+                qpos = None
+            if qpos is None:
+                continue
+
+            num  = str(_pick_value(r, "driver_number", "number", default=""))
+            name = _best_driver_name(r) or drivers.get(num) or str(num)  # prefer session names; then /drivers; then number
+            code = _pick_value(r, "three_letter_name") or three_letter.get(num) or _pick_value(r, "last_name") or num
+
+            rows.append({"driver": name, "code": str(code), "grid_quali": qpos, "driver_number": num})
+
+        out = pd.DataFrame(rows).sort_values("grid_quali").reset_index(drop=True)
+
+        # 4) Race starting grid -> grid (fallback to quali)
+        out["grid"] = out["grid_quali"]
+        if race is not None:
+            race_key = _pick_value(race, "session_key", "key")
+            try:
+                g_resp = requests.get(f"{OPENF1_BASE}/starting_grid", params={"session_key": race_key}, timeout=25)
+                g_resp.raise_for_status()
+                gres = g_resp.json()
+                by_num = {str(_pick_value(g, "driver_number")): _pick_value(g, "grid_position", "position") for g in gres if _pick_value(g, "driver_number") is not None}
+                if by_num:
+                    out["grid"] = out.apply(lambda r: by_num.get(str(r["driver_number"]), r["grid"]), axis=1)
+            except Exception:
+                pass
+
+        out["grid"] = pd.to_numeric(out["grid"], errors="coerce").fillna(out["grid_quali"]).astype(int)
+        return out[["driver","code","grid_quali","grid"]]
+
+    except Exception as e:
+        st.error(f"OpenF1 fetch failed: {e}")
+        return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
+
+def fetch_latest_quali_openf1() -> pd.DataFrame:
+    """
+    Get the latest meeting’s Qualifying with proper driver names & codes.
+    """
+    try:
+        s_resp = requests.get(f"{OPENF1_BASE}/sessions", params={"session_key": "latest"}, timeout=25)
+        s_resp.raise_for_status()
+        latest = s_resp.json()
+        if isinstance(latest, list) and latest:
+            latest = latest[0]
+        meeting_key = _pick_value(latest, "meeting_key", "key", default=None)
+        if not meeting_key:
+            return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
+
+        s2 = requests.get(f"{OPENF1_BASE}/sessions", params={"meeting_key": meeting_key}, timeout=25).json()
+
+        def _is_quali(s):
+            name = str(_pick_value(s, "session_name", "name", default="")).lower()
+            typ  = str(_pick_value(s, "session_type", "type", default="")).lower()
+            return ("qualifying" in name) or ("qualifying" in typ) or ("sprint shootout" in name) or ("sprint_shootout" in typ)
+
+        quali = next((s for s in s2 if _is_quali(s)), None)
+        race  = next((s for s in s2 if str(_pick_value(s, "session_name", "name", default="")).lower() == "race"), None)
+        if not quali:
+            return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
+
+        quali_key = _pick_value(quali, "session_key", "key")
+
+        # Quali classification
+        qres = requests.get(f"{OPENF1_BASE}/session_result", params={"session_key": quali_key}, timeout=25).json()
+
+        # Driver mapping for this session
+        drivers = {}
+        three_letter = {}
+        try:
+            djson = requests.get(f"{OPENF1_BASE}/drivers", params={"session_key": quali_key}, timeout=25).json()
+            for d in djson:
+                num = str(_pick_value(d, "driver_number"))
+                if not num or num == "None":
+                    continue
+                drivers[num] = _best_driver_name(d)
+                three_letter[num] = _pick_value(d, "three_letter_name")
+        except Exception:
+            pass
+
+        rows = []
+        for r in qres:
+            pos = _pick_value(r, "position", "classification_position", "final_position")
+            try:
+                pos = int(pos) if pos is not None and not (isinstance(pos, float) and math.isnan(pos)) else None
+            except Exception:
+                pos = None
+            if pos is None:
+                continue
+
+            num  = str(_pick_value(r, "driver_number", "number", default=""))
+            name = _best_driver_name(r) or drivers.get(num) or str(num)
+            code = _pick_value(r, "three_letter_name") or three_letter.get(num) or _pick_value(r, "last_name") or num
+            rows.append({"driver": name, "code": str(code), "grid_quali": pos, "driver_number": num})
+
+        out = pd.DataFrame(rows).sort_values("grid_quali").reset_index(drop=True)
+        out["grid"] = out["grid_quali"]
+
+        if race is not None:
+            try:
+                gres = requests.get(f"{OPENF1_BASE}/starting_grid", params={"session_key": _pick_value(race, "session_key", "key")}, timeout=25).json()
+                by_num = {str(_pick_value(g, "driver_number")): _pick_value(g, "grid_position", "position") for g in gres if _pick_value(g, "driver_number") is not None}
+                if by_num:
+                    out["grid"] = out.apply(lambda r: by_num.get(str(r["driver_number"]), r["grid"]), axis=1)
+            except Exception:
+                pass
+
+        out["grid"] = pd.to_numeric(out["grid"], errors="coerce").fillna(out["grid_quali"]).astype(int)
+        return out[["driver","code","grid_quali","grid"]]
+
+    except Exception as e:
+        st.error(f"OpenF1 latest fetch failed: {e}")
+        return pd.DataFrame(columns=["driver","code","grid_quali","grid"])
 
 SEASON_CIRCUIT_IDX = build_season_circuit_index()
 
@@ -470,9 +661,17 @@ if mode == "Full Grid":
     with st.sidebar:
         src = st.radio(
             "Grid data source",
-            ["Manual table", "Load from local Kaggle CSV", "Upload qualifying CSV", "Fetch latest qualifying (Ergast)"],
+            ["Manual table", "Load from local Kaggle CSV", "Upload qualifying CSV", FETCH_LABEL],
             horizontal=False
         )
+        # Only show the fetch button/toggle when the OpenF1 option is selected
+        if src == FETCH_LABEL:
+            fetch_click = st.button("Fetch now", key="fetch_quali_btn")
+            use_latest = st.toggle("Use latest meeting (ignore Season/Round)", value=False, key="openf1_latest")
+        else:
+            fetch_click = False
+            use_latest = False
+
 
 
 if SEASON_CIRCUIT_IDX and (season_sel is not None) and (round_num_selected is not None):
@@ -520,33 +719,89 @@ if SEASON_CIRCUIT_IDX and (season_sel is not None) and (round_num_selected is no
 
 #st.success(f"Model trained on {len(df):,} rows. Features: {feature_cols}")
 
-#Fetch qualifying results automatically
-def fetch_ergast_quali(season: int, round_num: int) -> pd.DataFrame:
-    url = f"https://ergast.com/api/f1/{season}/{round_num}/qualifying.json"
-    r = requests.get(url, params={"limit": 1000}, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-
-    races = j.get("MRData", {}).get("RaceTable", {}).get("Races", [])
-    if not races:
-        return pd.DataFrame(columns=["driver", "code", "grid_quali", "grid"])
-
-    rows = []
-    for q in races[0].get("QualifyingResults", []):
-        drv = q.get("Driver", {})
-        code = drv.get("code") or drv.get("familyName") or drv.get("driverId")
-        name = f"{drv.get('givenName','')} {drv.get('familyName','')}".strip()
+def fetch_quali(season: int, round_num: int) -> pd.DataFrame:
+    """
+    Return columns: driver, code, grid_quali, grid
+    Tries Ergast, then Jolpica (Ergast-compatible), then OpenF1 as a last resort.
+    """
+    # 1) Ergast + Jolpica (same JSON schema)
+    base_urls = [
+        f"https://ergast.com/api/f1/{season}/{round_num}/qualifying.json",
+        # Jolpica mirror is Ergast-compatible
+        f"http://api.jolpi.ca/ergast/f1/{season}/{round_num}/qualifying.json",
+    ]
+    last_err = None
+    for url in base_urls:
         try:
-            qpos = int(q.get("position"))
-        except:
-            qpos = None
-        rows.append({
-            "driver": name if name else code,
-            "code": code,
-            "grid_quali": qpos,
-            "grid": qpos
-        })
-    return pd.DataFrame(rows).dropna(subset=["grid_quali"]).sort_values("grid_quali").reset_index(drop=True)    
+            r = requests.get(url, params={"limit": 1000}, timeout=15)
+            r.raise_for_status()
+            j = r.json()
+            races = j.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+            if not races:
+                continue
+            rows = []
+            for q in races[0].get("QualifyingResults", []):
+                drv = q.get("Driver", {})
+                code = drv.get("code") or drv.get("familyName") or drv.get("driverId")
+                name = f"{drv.get('givenName','')} {drv.get('familyName','')}".strip() or code
+                try:
+                    qpos = int(q.get("position"))
+                except Exception:
+                    qpos = None
+                if qpos is not None:
+                    rows.append({"driver": name, "code": code, "grid_quali": qpos, "grid": qpos})
+            if rows:
+                return pd.DataFrame(rows).sort_values("grid_quali").reset_index(drop=True)
+        except Exception as e:
+            last_err = e  # try next mirror
+
+    # 2) OpenF1 (different schema; we map to your columns)
+    #    We find the qualifying session_key for the given season/round, then pull the classification.
+    try:
+        sess = requests.get(
+            "https://api.openf1.org/v1/sessions", params={"year": season}, timeout=20
+        ).json()
+
+        # Candidate qualifying-like sessions for that year
+        cand = [s for s in sess if s.get("session_name") in ("Qualifying", "Sprint Shootout")]
+
+        # Prefer exact round match if OpenF1 exposes 'round'
+        q = next((s for s in cand if str(s.get("round", "")) == str(round_num)), None)
+
+        # Fallback heuristic: pick the Nth qualifying of the year
+        if q is None and cand:
+            cand_sorted = sorted(
+                cand, key=lambda s: s.get("date_start") or s.get("session_start_utc") or ""
+            )
+            idx = max(0, min(int(round_num) - 1, len(cand_sorted) - 1))
+            q = cand_sorted[idx]
+
+        if q:
+            skey = q["session_key"]
+            results = requests.get(
+                "https://api.openf1.org/v1/session_result",
+                params={"session_key": skey},
+                timeout=20,
+            ).json()
+
+            rows = []
+            for r in results:
+                pos = r.get("position")
+                if pos is None:
+                    continue
+                # OpenF1 fields vary across seasons; be defensive
+                name = r.get("driver_name") or r.get("broadcast_name") or r.get("full_name")
+                code = r.get("driver_code") or str(r.get("driver_number") or "")
+                rows.append({"driver": name or code, "code": code, "grid_quali": int(pos), "grid": int(pos)})
+
+            if rows:
+                return pd.DataFrame(rows).sort_values("grid_quali").reset_index(drop=True)
+    except Exception:
+        pass
+
+    # If everything failed, return an empty DF
+    return pd.DataFrame(columns=["driver", "code", "grid_quali", "grid"])
+
 
 # Single driver prediction
 if mode == "Single Driver":
@@ -754,40 +1009,43 @@ elif mode == "Full Grid":
 
     # --- Session init for persistence across reruns ---
     if "grid_df" not in st.session_state:
-        st.session_state.grid_df = None       # holds the current grid (DataFrame)
+        st.session_state.grid_df = None
     if "grid_src" not in st.session_state:
-        st.session_state.grid_src = None      # "kaggle" | "ergast" | "upload" | "manual"
+        st.session_state.grid_src = None
     if "last_ctx" not in st.session_state:
         st.session_state.last_ctx = (season_sel, round_num_selected)
 
-    # If season/round changed and the source was auto (kaggle/ergast), clear auto grid
+    # Reset auto-loaded grids when season/round changes
     if (season_sel, round_num_selected) != st.session_state.last_ctx:
         if st.session_state.grid_src in ("kaggle", "ergast"):
             st.session_state.grid_df = None
             st.session_state.grid_src = None
         st.session_state.last_ctx = (season_sel, round_num_selected)
 
-    # Start with whatever we have in session (if any)
+    # Start from session
     user_df = st.session_state.grid_df
+    
+    # Handle each source
+    # --- OpenF1 fetch (selected round or latest) ---
+    if src == FETCH_LABEL and fetch_click:
+        with st.spinner("Fetching from OpenF1…"):
+            if use_latest:
+                dfq = fetch_latest_quali_openf1()
+            else:
+                if SEASON_CIRCUIT_IDX and season_sel is not None and round_num_selected is not None:
+                    dfq = fetch_quali_openf1(int(season_sel), int(round_num_selected))
+                else:
+                    st.warning("Pick a Season and Circuit in the sidebar first.")
+                    dfq = pd.DataFrame()
 
-    # --- Source handling (load + persist) ---
-    if src == "Fetch latest qualifying (Ergast)":
-        if SEASON_CIRCUIT_IDX and season_sel is not None and round_num_selected is not None:
-            if st.button("Fetch latest qualifying"):
-                with st.spinner("Fetching qualifying…"):
-                    try:
-                        erg = fetch_ergast_quali(int(season_sel), int(round_num_selected))
-                        if erg.empty:
-                            st.warning("No quali data yet.")
-                        else:
-                            st.toast(f"Loaded {len(erg)} quali rows", icon="✅")
-                            user_df = erg
-                            st.session_state.grid_df = erg
-                            st.session_state.grid_src = "ergast"
-                    except Exception as e:
-                        st.error(f"Ergast fetch failed: {e}")
-        else:
-            st.info("Pick a Season and Circuit in the sidebar first.")
+            if dfq.empty:
+                st.warning("No qualifying data found yet.")
+            else:
+                st.toast(f"Loaded {len(dfq)} quali rows", icon="✅")
+                user_df = dfq
+                st.session_state.grid_df = dfq
+                st.session_state.grid_src = "openf1_latest" if use_latest else "openf1"
+
 
     elif src == "Load from local Kaggle CSV":
         if SEASON_CIRCUIT_IDX and season_sel is not None and round_num_selected is not None:
@@ -845,13 +1103,11 @@ elif mode == "Full Grid":
             else:
                 st.error("Could not detect name/position columns. Include columns like 'driver' and 'position' (or 'grid_quali').")
 
-    # --- Default manual table if nothing in session or source ---
+    # Default manual if nothing yet
     if user_df is None:
         n_default = 10
-        data = {
-            "driver": [f"Driver {i}" for i in range(1, n_default+1)],
-            "grid": list(range(1, n_default+1)),
-        }
+        data = {"driver": [f"Driver {i}" for i in range(1, n_default+1)],
+                "grid": list(range(1, n_default+1))}
         if "grid_quali" in feature_cols:
             data["grid_quali"] = list(range(1, n_default+1))
         user_df = pd.DataFrame(data)
