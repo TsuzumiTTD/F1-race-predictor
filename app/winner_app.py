@@ -5,8 +5,10 @@ from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 import requests
 from streamlit import column_config
-import streamlit.components.v1 as components
 import math
+from typing import Dict, Iterable
+from sklearn.metrics import brier_score_loss, log_loss
+from sklearn.calibration import CalibratedClassifierCV
 
 
 # ISO country flags (emoji)
@@ -35,8 +37,40 @@ CIRCUIT_FLAGS = {
     "Abu Dhabi": "🇦🇪", "UAE": "🇦🇪", "United Arab Emirates": "🇦🇪",
 }
 
+NICE_LABELS = {
+    "grid": "Starting grid",
+    "grid_quali": "Qualifying position",
+    "grid_sq": "Grid²",
+    "grid_log": "log(1+grid)",
+    "front_row": "Front row (≤ P2)",
+    "start_penalty": "Start penalty (grid − quali)",
+
+    "drv_win_rate_career": "Driver win rate (career)",
+    "drv_podium_rate_career": "Driver podium rate (career)",
+    "drv_pts_per_start_career": "Driver points/start (career)",
+    "drv_years_exp_so_far": "Driver years of experience",
+    "drv_starts_cum": "Career starts",
+    "drv_wins_cum": "Career wins",
+    "drv_podiums_cum": "Career podiums",
+
+    "drv_track_win_rate": "Track win rate (driver)",
+    "drv_track_podium_rate": "Track podium rate (driver)",
+    "drv_track_starts_cum": "Track starts (driver)",
+    "drv_track_wins_cum": "Track wins (driver)",
+    "drv_track_podiums_cum": "Track podiums (driver)",
+
+    "wx_is_wet": "Wet race",
+    "wx_is_hot": "Hot race (≥30°C)",
+    "wx_temp_mean_c": "Mean temp (°C)",
+    "wx_temp_max_c": "Max temp (°C)",
+    "wx_precip_mm": "Precip (mm)",
+    "wx_windspeed_max_kmh": "Wind max (km/h)",
+    # add others you use…
+}
+
 FETCH_LABEL = "Fetch latest qualifying (OpenF1)"
 OPENF1_BASE = "https://api.openf1.org/v1"
+DEFAULT_POS_POINTS = {1:25, 2:18, 3:15, 4:12, 5:10, 6:8, 7:6, 8:4, 9:2, 10:1}
 
 
 
@@ -416,6 +450,333 @@ def fetch_latest_quali_openf1() -> pd.DataFrame:
 
 SEASON_CIRCUIT_IDX = build_season_circuit_index()
 
+# Fantasy top 10
+def _gumbel_sample_orders(scores: np.ndarray, n_sims: int, rng: np.random.Generator):
+    n = scores.shape[0]
+    g = rng.gumbel(loc=0.0, scale=1.0, size=(n_sims, n))  # Gumbel(0,1)
+    noisy = g + scores[None, :]
+    order = np.argsort(-noisy, axis=1)  # descending: winner first
+    return order
+
+def simulate_topk_from_winprob(win_prob: np.ndarray, n_sims: int = 5000, seed: int | None = None, k: int = 10):
+    eps = 1e-6
+    p = np.clip(win_prob.astype(float), eps, 1 - eps)
+    scores = np.log(p)  # PL scores; only ratios matter
+    rng = np.random.default_rng(seed)
+    order = _gumbel_sample_orders(scores, n_sims, rng)
+
+    n = p.shape[0]
+    pos_of_driver = np.empty_like(order)
+    row_idx = np.arange(n_sims)[:, None]
+    pos_of_driver[row_idx, order] = np.arange(n)[None, :]
+    exp_pos = pos_of_driver.mean(axis=0) + 1.0  # 1-based
+
+    k = min(k, n)
+    pos_counts = np.zeros((n, k), dtype=np.int32)
+    for pos in range(k):
+        idx_at_pos = order[:, pos]
+        counts = np.bincount(idx_at_pos, minlength=n)
+        pos_counts[:, pos] = counts
+
+    pos_rate = (pos_counts / float(n_sims)) * 100.0
+    return order, exp_pos, pos_counts, pos_rate
+
+# F1 Fantasy Single driver contributions
+def pretty_label(col: str) -> str:
+    return NICE_LABELS.get(col, col)
+
+def explain_logreg_percent(clf, feature_names, xvec):
+    coefs = clf.coef_[0]
+    raw = coefs * xvec
+    denom = np.sum(np.abs(raw)) + 1e-9
+    pct = (raw / denom) * 100.0
+    dfc = pd.DataFrame({
+        "Feature": [pretty_label(f) for f in feature_names],
+        "Contribution %": pct
+    }).sort_values("Contribution %", key=lambda s: s.abs(), ascending=False)
+    return dfc
+
+def parse_points_table(csv_text: str) -> Dict[int, int]:
+    parts = [p.strip() for p in (csv_text or "").split(",") if p.strip()]
+    return {i+1: int(v) for i, v in enumerate(parts)}
+
+def positions_from_order(order: np.ndarray) -> np.ndarray:
+    n_sims, n = order.shape
+    pos = np.empty_like(order)
+    rows = np.arange(n_sims)[:, None]
+    pos[rows, order] = np.arange(n)[None, :] + 1
+    return pos
+
+def expected_points_from_positions(pos_matrix: np.ndarray,
+                                   pos_points: Dict[int, int],
+                                   outside_points: int = 0) -> np.ndarray:
+    n_sims, n = pos_matrix.shape
+    max_p = pos_matrix.max()
+    pts_vec = np.full((max_p + 1,), float(outside_points))
+    for k, v in pos_points.items():
+        if 1 <= k <= max_p:
+            pts_vec[k] = float(v)
+    pts = pts_vec[pos_matrix]
+    return pts.mean(axis=0)
+
+# === Model quality / backtest helpers ===
+def _fit_fold_lr(train_df: pd.DataFrame, feature_cols: list[str], calibrate: bool):
+    """Fit a Logistic Regression on the training fold (optionally isotonic-calibrated)."""
+    # Per-fold defaults (avoid data leakage)
+    fold_defaults = train_df[feature_cols].mean(numeric_only=True).fillna(0.0)
+
+    Xtr_df = train_df[feature_cols].astype(float).fillna(fold_defaults).fillna(0.0)
+    # Final sanitation: kill any lingering NaN/Inf
+    Xtr = np.nan_to_num(Xtr_df.values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    ytr = pd.to_numeric(train_df["win"], errors="coerce").fillna(0).astype(int).values
+
+    base = LogisticRegression(max_iter=2000, class_weight="balanced")
+    clf = CalibratedClassifierCV(base, method="isotonic", cv=5) if calibrate else base
+    clf.fit(Xtr, ytr)
+    return clf, fold_defaults
+
+
+
+def _predict_fold(
+    clf,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    fold_defaults: pd.Series,
+    *,
+    method: str = "lr",                  # "lr" | "softmax" | "blend"
+    grid_alpha: float = 0.08,
+    gap_beta: float = 0.06,
+    temp_T: float = 1.25,
+    blend: float = 0.6,
+) -> np.ndarray:
+    """Predict probabilities for a test fold. If method != 'lr', normalizes per-race."""
+    # Work on a positional index so grouping returns integer positions
+    tdf = test_df.reset_index(drop=True)
+
+    # Build X (NaN/Inf safe)
+    Xte_df = tdf[feature_cols].astype(float).fillna(fold_defaults).fillna(0.0)
+    Xte = np.nan_to_num(Xte_df.values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Plain LR (fast path)
+    if method == "lr" or "raceId" not in tdf.columns:
+        return clf.predict_proba(Xte)[:, 1]
+
+    # Precompute pieces used by softmax/blend
+    # Base logits: decision_function if available, else logit(p)
+    if hasattr(clf, "decision_function"):
+        logits_all = clf.decision_function(Xte)
+        logits_all = np.asarray(logits_all).reshape(-1)  # binary -> (n,)
+    else:
+        p_all = clf.predict_proba(Xte)[:, 1]
+        eps = 1e-6
+        p_clip = np.clip(p_all, eps, 1 - eps)
+        logits_all = np.log(p_clip / (1 - p_clip))
+    # For blend we also need LR probs
+    p_lr_all = clf.predict_proba(Xte)[:, 1] if method == "blend" else None
+
+    # Group by race and normalize within each race
+    out = np.zeros(len(tdf), dtype=float)
+    groups = tdf.groupby("raceId", sort=False).indices  # dict: raceId -> array of positions
+    for _, pos in groups.items():
+        pos = np.asarray(pos, dtype=int)
+        scores = logits_all[pos].copy()
+
+        # optional tilts
+        if "grid" in tdf.columns:
+            g = pd.to_numeric(tdf.loc[pos, "grid"], errors="coerce").to_numpy(dtype=float)
+            g = np.nan_to_num(g, nan=np.nanmean(g) if np.isfinite(g).any() else 1.0)
+            scores += (-grid_alpha) * (g - 1.0)
+        if {"grid", "grid_quali"}.issubset(tdf.columns):
+            sp = (
+                pd.to_numeric(tdf.loc[pos, "grid"], errors="coerce").to_numpy(dtype=float)
+                - pd.to_numeric(tdf.loc[pos, "grid_quali"], errors="coerce").to_numpy(dtype=float)
+            )
+            sp = np.nan_to_num(sp, nan=0.0)
+            scores += (-gap_beta) * sp
+
+        # normalize to per-race win probabilities
+        scores = scores - np.max(scores)  # stability
+        expu = np.exp(scores / max(temp_T, 1e-6))
+        p_sm = expu / max(expu.sum(), 1e-9)
+
+        if method == "softmax":
+            p_r = p_sm
+        elif method == "blend":
+            p_lr = p_lr_all[pos]
+            p_lr_norm = p_lr / max(p_lr.sum(), 1e-9)
+            p_r = (1.0 - blend) * p_lr_norm + blend * p_sm
+        else:
+            p_r = clf.predict_proba(Xte[pos, :])[:, 1]
+
+        out[pos] = p_r
+
+    return out
+
+
+
+
+
+def _top1_hit_rate(test_df: pd.DataFrame, p: np.ndarray) -> tuple[float, int, int]:
+    """Top-1 hit rate at the race level (did our highest-prob driver win?)."""
+    tmp = test_df[["raceId", "win"]].copy()
+    tmp["p"] = p
+    hits = 0
+    races = 0
+    for rid, g in tmp.groupby("raceId"):
+        if g.empty:
+            continue
+        idx = g["p"].idxmax()
+        hits += int(g.loc[idx, "win"] == 1)
+        races += 1
+    rate = hits / races if races else 0.0
+    return rate, hits, races
+
+
+def backtest_by_season(df_all: pd.DataFrame, feature_cols: list[str], calibrate: bool = True) -> tuple[pd.DataFrame, dict]:
+    """
+    Rolling-season backtest: for each season S, train on seasons < S and test on S.
+    Returns (per_season_df, overall_summary_dict).
+    """
+    needed = {"season", "raceId", "win", *feature_cols}
+    if not needed.issubset(df_all.columns):
+        missing = sorted(list(needed - set(df_all.columns)))
+        raise ValueError(f"Backtest needs columns missing in df: {missing}")
+
+    df_use = df_all.dropna(subset=["season", "raceId"]).copy()
+    seasons = sorted(pd.to_numeric(df_use["season"], errors="coerce").dropna().unique().astype(int))
+
+    rows = []
+    all_hits = all_races = 0
+    w_logloss = w_brier = 0.0
+    n_rows_total = 0
+
+    for s in seasons:
+        train = df_use[df_use["season"] < s].copy()
+        test  = df_use[df_use["season"] == s].copy()
+
+        # Skip very early seasons with no prior training data
+        if train["raceId"].nunique() < 2 or len(train) < 100 or test.empty:
+            continue
+
+        clf_fold, fold_defaults = _fit_fold_lr(train, feature_cols, calibrate=calibrate)
+        p = _predict_fold(
+        clf_fold, test, feature_cols, fold_defaults,
+        method="blend", grid_alpha=0.08, gap_beta=0.06, temp_T=1.25, blend=0.6,
+        )
+
+
+        y = test["win"].astype(int).values
+        try:
+            ll = log_loss(y, p, labels=[0,1])
+        except ValueError:
+            # Edge case: only one class present
+            ll = np.nan
+        br = brier_score_loss(y, p)
+
+        top1, hits, races = _top1_hit_rate(test, p)
+
+        rows.append({
+            "season": s,
+            "n_rows": len(test),
+            "n_races": races,
+            "log_loss": ll,
+            "brier": br,
+            "top1_hit": top1,
+            "avg_pred_win_pct": float(np.mean(p))*100.0,
+        })
+
+        # accumulate weighted
+        n_rows_total += len(test)
+        if not np.isnan(ll):
+            w_logloss += ll * len(test)
+        w_brier  += br * len(test)
+        all_hits += hits
+        all_races += races
+
+    per_season = pd.DataFrame(rows).sort_values("season").reset_index(drop=True)
+
+    overall = {
+        "seasons_evaluated": int(per_season["season"].nunique()) if not per_season.empty else 0,
+        "n_rows_total": int(n_rows_total),
+        "n_races_total": int(all_races),
+        "log_loss_weighted": (w_logloss / n_rows_total) if n_rows_total else np.nan,
+        "brier_weighted":    (w_brier  / n_rows_total) if n_rows_total else np.nan,
+        "top1_hit_overall":  (all_hits / all_races) if all_races else np.nan,
+    }
+    return per_season, overall
+
+def _softmax_vec(scores: np.ndarray, T: float = 1.0) -> np.ndarray:
+    s = np.asarray(scores, dtype=float)
+    s = s / max(T, 1e-6)
+    s = s - np.max(s)  # for numerical stability
+    e = np.exp(s)
+    denom = e.sum()
+    return e / (denom if denom > 0 else 1.0)
+
+def _safe_logits(clf, X: np.ndarray) -> np.ndarray:
+    """Return a real-valued score for each row, even for calibrated models."""
+    # Preferred: raw margins if available
+    if hasattr(clf, "decision_function"):
+        z = clf.decision_function(X)
+        # Some classifiers return shape (n_samples, n_classes); use the positive class
+        if isinstance(z, np.ndarray) and z.ndim == 2 and z.shape[1] == 2:
+            z = z[:, 1]
+        return z.astype(float)
+
+    # Fallback: logit of predicted probability
+    if hasattr(clf, "predict_proba"):
+        p = clf.predict_proba(X)[:, 1]
+        eps = 1e-6
+        p = np.clip(p, eps, 1 - eps)
+        return np.log(p) - np.log(1 - p)
+
+    # Last resort: decision_function/predict_proba not present — use zeros
+    return np.zeros(X.shape[0], dtype=float)
+
+
+def compute_win_probs(
+    X: np.ndarray,
+    *,
+    clf,
+    grid: Iterable | None = None,
+    start_penalty: Iterable | None = None,  # grid - quali (positive = penalty)
+    method: str = "blend",                  # "lr" | "softmax" | "blend"
+    grid_alpha: float = 0.08,
+    gap_beta: float = 0.06,
+    temp_T: float = 1.25,
+    blend: float = 0.6
+) -> np.ndarray:
+    """Single source of truth for converting model outputs into race-normalized win probs."""
+    base_logits = _safe_logits(clf, X)
+    scores = base_logits.copy()
+
+    # Optional tilt toward better grid / against start penalties
+    if method in ("softmax", "blend"):
+        if grid is not None:
+            g = np.asarray(grid, dtype=float)
+            scores += (-grid_alpha) * (g - 1.0)
+        if start_penalty is not None:
+            sp = np.asarray(start_penalty, dtype=float)  # (= grid - quali)
+            scores += (-gap_beta) * sp
+
+    if method == "softmax":
+        p = _softmax_vec(scores, T=temp_T)
+    elif method == "blend":
+        # Normalize LR probs across the grid (race-level) then blend with softmax scores
+        p_lr = clf.predict_proba(X)[:, 1]
+        denom = max(p_lr.sum(), 1e-9)
+        p_lr_norm = p_lr / denom
+        p_sm = _softmax_vec(scores, T=temp_T)
+        p = (1.0 - blend) * p_lr_norm + blend * p_sm
+    else:  # "lr"
+        p = clf.predict_proba(X)[:, 1]
+
+    return p
+
+
+
+
 # CSS
 st.markdown("""
 <style>
@@ -462,8 +823,176 @@ details > div, .streamlit-expanderContent {
   padding-top: 4px !important;
 }
 
+/* ---- Sidebar typography ---- */
+:is(aside, section)[data-testid="stSidebar"] {}  /* keep parser happy */
+
+/* Sidebar headers (st.sidebar.header/subheader) */
+:is(aside, section)[data-testid="stSidebar"] h2,
+:is(aside, section)[data-testid="stSidebar"] h3 {
+  font-size: 2.35rem !important;
+  font-weight: 800 !important;
+  letter-spacing: .2px;
+}
+
+/* Widget labels (Selectbox/Radio/Toggle/Button labels, etc.) */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stWidgetLabel"] label p {
+  font-size: 1.50rem !important;
+  font-weight: 700 !important;
+  line-height: 1.35 !important;
+  margin-bottom: .15rem !important;
+}
+
+/* Radio options / toggle text */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label p {
+  font-size: 1.36rem !important;
+}
+
+/* Selectbox chosen value & dropdown input text */
+:is(aside, section)[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+  font-size: 1.25rem !important;
+}
+
+/* Inputs (text, number, textarea) */
+:is(aside, section)[data-testid="stSidebar"] input,
+:is(aside, section)[data-testid="stSidebar"] textarea {
+  font-size: 1.56rem !important;
+}
+
+/* Buttons in sidebar */
+:is(aside, section)[data-testid="stSidebar"] button {
+  font-size: 1.56rem !important;
+  padding: 0.5rem 0.75rem !important;
+}
+
+/* Slider ticks & value bubble */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stTickBarMin"],
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stTickBarMax"],
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stSliderValue"] {
+  font-size: 1.00rem !important;
+}
+/* --- Make sidebar toggles & radio bullets bigger --- */
+
+/* Ensure scaled controls aren't clipped */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stWidget"] { 
+  overflow: visible; 
+}
+
+/* Enlarge the TOGGLE switch (st.toggle) */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stToggle"] label > div:first-child {
+  transform: scale(1.25);
+  transform-origin: left center;
+}
+
+/* Fallback for some Streamlit/BaseWeb builds */
+:is(aside, section)[data-testid="stSidebar"] [data-baseweb="switch"] {
+  transform: scale(1.25);
+  transform-origin: left center;
+}
+
+/* Enlarge RADIO bullets (st.radio) */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {
+  transform: scale(1.2);
+  transform-origin: left center;
+  margin-right: .4rem; /* keep spacing nice */
+}
+
+/* Slightly increase row height for easier tapping */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label {
+  padding: .15rem 0;
+}
+
+/* --- Align + size sidebar toggles & radio options --- */
+
+/* Keep scaled controls from being clipped */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stWidget"] { 
+  overflow: visible; 
+}
+
+/* TOGGLES (st.toggle) — put control + text on one row and center vertically */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stToggle"] label {
+  display: flex !important;
+  align-items: center !important;
+  gap: .45rem;
+}
+
+/* Enlarge the switch and nudge it so it's visually centered with the text */
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stToggle"] label > div:first-child {
+  transform: scale(1.25) translateY(1px); /* tweak translateY to 0/2px if needed */
+  transform-origin: left center;
+}
+
+/* RADIO (st.radio) — center bullets with text */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label {
+  display: flex !important;
+  align-items: center !important;
+  gap: .45rem;
+}
+
+/* Enlarge the bullet and nudge it to align */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {
+  transform: scale(1.2) translateY(1px);  /* adjust to taste */
+  transform-origin: left center;
+}
+
+/* Tighten label text vertical metrics so they center nicely */
+:is(aside, section)[data-testid="stSidebar"] [role="radiogroup"] label p,
+:is(aside, section)[data-testid="stSidebar"] [data-testid="stToggle"] label p {
+  margin: 0 !important;
+  line-height: 1.2 !important;
+}
+
+/* ===== Main content typography (not sidebar) ===== */
+section[data-testid="stMain"] h1 {
+  font-size: 2.0rem !important;
+  font-weight: 800;
+  margin: 0 0 .6rem;
+}
+section[data-testid="stMain"] h2 {
+  font-size: 1.45rem !important;
+  font-weight: 800;
+  margin: 1.0rem 0 .4rem;
+}
+section[data-testid="stMain"] h3 {
+  font-size: 1.15rem !important;
+  font-weight: 700;
+  margin: .75rem 0 .3rem;
+}
+
+/* Your race banner title should sit between h2 and h3 */
+.banner h3 {
+  font-size: 1.35rem !important;
+  font-weight: 800;
+}
+
+/* Make the "Tweak inputs" custom title slightly smaller than h2 */
+section[data-testid="stMain"] .whatif-title {
+  font-size: 1.30rem !important;
+  font-weight: 700;
+  letter-spacing: .2px;
+}
+
+/* Dataframe readability: header/body font sizes & spacing */
+section[data-testid="stMain"] [data-testid="stDataFrame"] {
+  margin: .25rem 0 1.1rem;
+}
+section[data-testid="stMain"] [data-testid="stDataFrame"] div[role="columnheader"] {
+  font-size: .96rem !important;
+  font-weight: 700 !important;
+}
+section[data-testid="stMain"] [data-testid="stDataFrame"] div[role="gridcell"] {
+  font-size: .95rem !important;
+}
+
+/* Captions a touch smaller and tighter */
+section[data-testid="stMain"] [data-testid="stCaptionContainer"] p {
+  font-size: .92rem !important;
+  line-height: 1.25 !important;
+  margin-top: .25rem !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
+
 
 
 
@@ -523,33 +1052,6 @@ with st.expander("Debug info"):
         cov = df[[c for c in wx_cols if c in df.columns]].notna().mean().round(3)
         st.caption(f"wx coverage (fraction non-null): {cov.to_dict()}")
 
-
-
-# --- Weather viewer ---
-if has_wx and {"season","round"}.issubset(df.columns) and (SEASON_CIRCUIT_IDX):
-    if ("season_sel" in locals()) and ("round_num_selected" in locals()) and (season_sel is not None) and (round_num_selected is not None):
-        df_wx_candidates = df.dropna(subset=[c for c in wx_cols if c in df.columns], how="all")
-        race_rows = df_wx_candidates[
-            (df_wx_candidates["season"].astype(str) == str(season_sel)) &
-            (df_wx_candidates["round"].astype(str)  == str(round_num_selected))
-        ]
-        if not race_rows.empty:
-            r0 = race_rows.iloc[0]
-            st.sidebar.markdown("### Weather (from enriched file)")
-            c1, c2 = st.sidebar.columns(2)
-            def fmt(v, unit=""):
-                return "—" if pd.isna(v) else f"{float(v):.1f}{unit}"
-            c1.metric("Temp (mean)", fmt(r0.get("wx_temp_mean_c"), "°C"))
-            c2.metric("Temp (max)",  fmt(r0.get("wx_temp_max_c"),  "°C"))
-            c1.metric("Precip",      fmt(r0.get("wx_precip_mm"),   " mm"))
-            c2.metric("Wind (max)",  fmt(r0.get("wx_windspeed_max_kmh"), " km/h"))
-            wet = int(r0.get("wx_is_wet", 0)) if not pd.isna(r0.get("wx_is_wet", np.nan)) else 0
-            hot = int(r0.get("wx_is_hot", 0)) if not pd.isna(r0.get("wx_is_hot", np.nan)) else 0
-            st.sidebar.caption(f"**Wet?** {'Yes' if wet else 'No'} · **Hot (≥30°C)?** {'Yes' if hot else 'No'}")
-        else:
-            st.sidebar.caption("_No weather found for this race in the enriched file._")
-
-
 df["position"] = pd.to_numeric(df.get("position"), errors="coerce")
 
 # Coerce any feature columns we might use
@@ -591,6 +1093,101 @@ y = df["win"].astype(int)
 
 clf = LogisticRegression(max_iter=2000, class_weight="balanced")
 clf = train_lr(X, y)
+
+# === Simple Model Quality check (stateful & no nested expanders) ===
+with st.expander("How good is this model? (one-click check)", expanded=False):
+    st.caption("We replay past seasons we didn't train on and see how often our top pick actually won.")
+
+    # Init session state buckets
+    if "modelq_overall" not in st.session_state:
+        st.session_state.modelq_overall = None
+        st.session_state.modelq_per_season = None
+        st.session_state.modelq_error = None
+
+    # Run backtest on click -> save results to session_state
+    run_now = st.button("Check now", type="primary", key="modelq_run")
+    if run_now:
+        if not {"season", "raceId"}.issubset(df.columns):
+            st.session_state.modelq_error = "Needs 'season' and 'raceId' columns in your processed file."
+            st.session_state.modelq_overall = None
+            st.session_state.modelq_per_season = None
+        else:
+            with st.spinner("Running backtest by season…"):
+                try:
+                    per_season, overall = backtest_by_season(
+                        df[["season","raceId","win", *feature_cols]].copy(),
+                        feature_cols,
+                        calibrate=True
+                    )
+                    st.session_state.modelq_overall = overall
+                    st.session_state.modelq_per_season = per_season
+                    st.session_state.modelq_error = None
+                except Exception as e:
+                    st.session_state.modelq_error = str(e)
+                    st.session_state.modelq_overall = None
+                    st.session_state.modelq_per_season = None
+
+    # Render (persists across reruns so the toggle works)
+    if st.session_state.modelq_error:
+        st.error(f"Backtest failed: {st.session_state.modelq_error}")
+    elif st.session_state.modelq_overall is not None:
+        overall    = st.session_state.modelq_overall
+        per_season = st.session_state.modelq_per_season
+
+        top1  = float(overall.get("top1_hit_overall") or 0.0)
+        brier = overall.get("brier_weighted")
+        brier = float(brier) if brier is not None else float("nan")
+
+        def letter_grade(top1_hit: float, brier_val: float) -> str:
+            score = 0
+            if top1_hit >= 0.55: score += 3
+            elif top1_hit >= 0.48: score += 2
+            elif top1_hit >= 0.40: score += 1
+            if not np.isnan(brier_val):
+                if brier_val <= 0.085: score += 3
+                elif brier_val <= 0.100: score += 2
+                elif brier_val <= 0.115: score += 1
+            bands = ["C","B-","B","B+","A-","A","A+"]
+            return bands[min(score, len(bands)-1)]
+
+        grade = letter_grade(top1, brier)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Top-1 hit", f"{top1*100:.0f}%")
+        c2.metric("Brier (↓ better)", "—" if np.isnan(brier) else f"{brier:.3f}")
+        c3.metric("Overall grade", grade)
+
+        show_details = st.toggle("Show per-season details", value=False, key="modelq_details")
+        if show_details and per_season is not None and not per_season.empty:
+            from streamlit import column_config as _cc
+            st.dataframe(
+                per_season.assign(
+                    log_loss=lambda d: d["log_loss"].round(4),
+                    brier=lambda d: d["brier"].round(4),
+                    top1_hit=lambda d: (d["top1_hit"]*100).round(1),
+                ),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "season": _cc.NumberColumn("Season", format="%d"),
+                    "n_rows": _cc.NumberColumn("# rows", format="%d"),
+                    "n_races": _cc.NumberColumn("# races", format="%d"),
+                    "log_loss": _cc.NumberColumn("Log loss", format="%.4f"),
+                    "brier": _cc.NumberColumn("Brier", format="%.4f"),
+                    "top1_hit": _cc.ProgressColumn("Top-1 hit", format="%.1f%%",
+                                                   min_value=0.0, max_value=100.0),
+                }
+            )
+
+        st.caption(
+            "Top-1 hit = how often our #1 pick actually won. "
+            "Brier = probability error (lower is better). "
+            "Grade combines both so you don’t have to parse the numbers."
+        )
+    else:
+        st.caption("Click **Check now** to run the backtest. Results will stay visible so you can toggle details.")
+
+
+
 
 # --- Build latest driver-specific feature reference from the enriched CSV ---
 driver_feature_cols = [c for c in feature_cols if c.startswith("drv_")]  # e.g., drv_win_rate_career, etc.
@@ -714,8 +1311,6 @@ if SEASON_CIRCUIT_IDX and (season_sel is not None) and (round_num_selected is no
     </div>
     """
     st.markdown(header_html, unsafe_allow_html=True)
-
-
 
 #st.success(f"Model trained on {len(df):,} rows. Features: {feature_cols}")
 
@@ -877,6 +1472,20 @@ if mode == "Single Driver":
     prob_win = clf.predict_proba(x_row)[0, 1]
     st.metric("Predicted Win Probability", f"{prob_win*100:.1f}%")
     st.caption("Using the selected features; missing inputs are filled with historical means.")
+    
+    # --- Top feature contributions (percent of total impact) ---
+    contrib_df = explain_logreg_percent(clf, feature_cols, x_row[0]).head(10)
+    from streamlit import column_config as _cc
+    st.caption("Top feature contributions")
+    st.dataframe(
+        contrib_df,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Contribution %": _cc.NumberColumn(format="%.1f%%")
+        }
+    )
+
 
     # --- Top feature contributions (readable names + percent impact) ---
 
@@ -1017,10 +1626,11 @@ elif mode == "Full Grid":
 
     # Reset auto-loaded grids when season/round changes
     if (season_sel, round_num_selected) != st.session_state.last_ctx:
-        if st.session_state.grid_src in ("kaggle", "ergast"):
+        if st.session_state.grid_src in ("kaggle", "ergast", "openf1", "openf1_latest"):
             st.session_state.grid_df = None
             st.session_state.grid_src = None
         st.session_state.last_ctx = (season_sel, round_num_selected)
+
 
     # Start from session
     user_df = st.session_state.grid_df
@@ -1048,20 +1658,22 @@ elif mode == "Full Grid":
 
 
     elif src == "Load from local Kaggle CSV":
+    # Auto-load immediately when Season/Circuit is chosen (no button needed)
         if SEASON_CIRCUIT_IDX and season_sel is not None and round_num_selected is not None:
-            st.write(f"Using **Season {season_sel}** – {lab}")
-            if st.button("Load from local CSV"):
+            # Re-load if there's nothing yet, or if previous source wasn't Kaggle
+            need_autoload = (st.session_state.grid_df is None) or (st.session_state.grid_src != "kaggle")
+            if need_autoload:
                 try:
                     auto_df = load_local_quali(int(season_sel), int(round_num_selected))
                     if auto_df.empty:
                         st.warning("No qualifying rows found for that season/circuit. Check your Kaggle coverage.")
                     else:
-                        st.success(f"Loaded {len(auto_df)} entries from data/raw/*.csv")
-                        user_df = auto_df
                         st.session_state.grid_df = auto_df
                         st.session_state.grid_src = "kaggle"
+                        user_df = auto_df
+                        st.toast(f"Loaded {len(auto_df)} entries from data/raw/*.csv", icon="✅")
 
-                        # (Optional) show weather snippet from enriched dataset
+                        # (Optional) small weather snippet using your enriched file
                         if has_wx and "season" in df.columns and "round" in df.columns:
                             cand = df[
                                 (df["season"].astype(str) == str(season_sel)) &
@@ -1069,21 +1681,22 @@ elif mode == "Full Grid":
                             ].dropna(subset=[c for c in wx_cols if c in df.columns], how="all")
                             if not cand.empty:
                                 r0 = cand.iloc[0]
-                                st.info("Weather from enriched dataset for this race:")
-                                colA, colB, colC, colD = st.columns(4)
-                                fmt = lambda v,u="": "—" if pd.isna(v) else f"{float(v):.1f}{u}"
-                                colA.metric("Temp (mean)", fmt(r0.get("wx_temp_mean_c"), "°C"))
-                                colB.metric("Temp (max)",  fmt(r0.get("wx_temp_max_c"),  "°C"))
-                                colC.metric("Precip",      fmt(r0.get("wx_precip_mm"),   " mm"))
-                                colD.metric("Wind (max)",  fmt(r0.get("wx_windspeed_max_kmh"), " km/h"))
-                                wet = int(r0.get("wx_is_wet", 0)) if not pd.isna(r0.get("wx_is_wet", np.nan)) else 0
-                                hot = int(r0.get("wx_is_hot", 0)) if not pd.isna(r0.get("wx_is_hot", np.nan)) else 0
-                                st.caption(f"**Wet?** {'Yes' if wet else 'No'} · **Hot (≥30°C)?** {'Yes' if hot else 'No'}")
+                                st.caption(
+                                    f"Weather (from enriched data): "
+                                    f"mean {r0.get('wx_temp_mean_c', float('nan')):.1f}°C, "
+                                    f"max {r0.get('wx_temp_max_c', float('nan')):.1f}°C, "
+                                    f"precip {r0.get('wx_precip_mm', float('nan')):.1f} mm, "
+                                    f"{'wet' if int(r0.get('wx_is_wet', 0) or 0) else 'dry'}"
+                                )
                 except Exception as e:
                     st.error(f"Local load failed: {e}")
                     st.info("Ensure data/raw/races.csv, qualifying.csv, and drivers.csv exist (from your Kaggle download).")
+            else:
+                # Already have Kaggle data in session; just use it
+                user_df = st.session_state.grid_df
         else:
             st.warning("Pick a Season and Circuit in the sidebar first.")
+
 
     elif src == "Upload qualifying CSV":
         st.write("CSV should include **driver name** and **qualifying position**.")
@@ -1114,24 +1727,29 @@ elif mode == "Full Grid":
         st.session_state.grid_df = user_df
         st.session_state.grid_src = "manual"
 
-    # --- Stable key to avoid resets on tweaks (only one editor in app) ---
-    editor_key = "grid_editor_fullgrid"
+    # --- Show editor only for Manual table; otherwise skip straight to predictions ---
+    show_editor = (src == "Manual table") or (st.session_state.get("grid_src") == "manual")
 
-    # Editor (seeded from session), and persist edits back to session
-    edit_df = st.data_editor(
-        user_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "driver": column_config.TextColumn("Driver", help="3-letter code or full name"),
-            "grid": column_config.NumberColumn("Grid", min_value=1, max_value=20, step=1),
-            **({"grid_quali": column_config.NumberColumn("Quali", min_value=1, max_value=20, step=1)}
-              if "grid_quali" in user_df.columns else {}),
-        },
-        key=editor_key,
-    )
-    # Persist the edited table so it survives any widget change
-    st.session_state.grid_df = edit_df
+    if show_editor:
+        editor_key = "grid_editor_fullgrid"
+        edit_df = st.data_editor(
+            user_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "driver": column_config.TextColumn("Driver", help="3-letter code or full name"),
+                "grid": column_config.NumberColumn("Grid", min_value=1, max_value=20, step=1),
+                **({"grid_quali": column_config.NumberColumn("Quali", min_value=1, max_value=20, step=1)}
+                if "grid_quali" in user_df.columns else {}),
+            },
+            key=editor_key,
+        )
+        # Persist edits
+        st.session_state.grid_df = edit_df
+    else:
+        # Kaggle / OpenF1 / Upload: no editor, go straight to predictions
+        edit_df = user_df.copy()
+
 
     # --- Clean input ---
     edit_df["grid"] = pd.to_numeric(edit_df.get("grid"), errors="coerce")
@@ -1185,7 +1803,6 @@ elif mode == "Full Grid":
 
     if circuit_id_selected is not None:
         pred_rows["circuitId"] = int(circuit_id_selected)
-        st.caption(f"Predicting for: **Season {season_sel}** — {lab}")
 
     if {"driverId","circuitId"}.issubset(pred_rows.columns) and not driver_circuit_feats_ref.empty:
         driver_circuit_feats_ref["driverId"] = pd.to_numeric(driver_circuit_feats_ref["driverId"], errors="coerce").astype("Int64")
@@ -1193,10 +1810,16 @@ elif mode == "Full Grid":
         pred_rows["circuitId"] = pd.to_numeric(pred_rows["circuitId"], errors="coerce").astype("Int64")
         pred_rows = pred_rows.merge(driver_circuit_feats_ref, on=["driverId","circuitId"], how="left")
 
-    # --- BASE matrix & predict ---
+    # --- BASE matrix & predict (race-level softmax) ---
     X_base_df = pred_rows.reindex(columns=feature_cols).fillna(feature_defaults).fillna(0.0)
     X_base = np.nan_to_num(X_base_df.values.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
-    proba_base = clf.predict_proba(X_base)[:, 1]
+    proba_base = compute_win_probs(
+        X_base, clf=clf,
+        grid=pred_rows.get("grid"),
+        start_penalty=(pred_rows["grid"] - pred_rows["grid_quali"]) if {"grid","grid_quali"}.issubset(pred_rows.columns) else None,
+        method="blend", grid_alpha=0.08, gap_beta=0.06, temp_T=1.25, blend=0.6,
+    )
+
 
     table_df = pred_rows.copy()
     table_df["win_prob"] = proba_base
@@ -1240,7 +1863,14 @@ elif mode == "Full Grid":
     # re-predict with tweaks
     X_tuned_df = tuned.reindex(columns=feature_cols).fillna(feature_defaults).fillna(0.0)
     X_tuned    = np.nan_to_num(X_tuned_df.values.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
-    tuned["win_prob"] = clf.predict_proba(X_tuned)[:, 1]
+    tuned["win_prob"] = compute_win_probs(
+    X_tuned, clf=clf,
+    grid=tuned.get("grid"),
+    start_penalty=(tuned["grid"] - tuned["grid_quali"]) if {"grid","grid_quali"}.issubset(tuned.columns) else None,
+    method="blend", grid_alpha=0.08, gap_beta=0.06, temp_T=1.25, blend=0.6,
+)
+
+
     tuned = tuned.sort_values("win_prob", ascending=False).reset_index(drop=True)
     tuned["win_pct"] = tuned["win_prob"] * 100.0
 
@@ -1251,7 +1881,7 @@ elif mode == "Full Grid":
     show_cols = [c for c in ["driver","grid","grid_quali","wx_is_wet","wx_temp_max_c"] if c in display_df.columns] + ["win_pct"]
     display_cols = [c for c in show_cols if c in display_df.columns]
 
-    st.write("### Predicted Win Probabilities")
+    st.header("Predicted Win Probabilities")
     st.dataframe(
         display_df[display_cols],
         use_container_width=True,
@@ -1262,6 +1892,73 @@ elif mode == "Full Grid":
         },
         hide_index=True,
     )
+    
+    # --- 🎮 Fantasy helper: Expected points & DRS recommendation ---
+    st.header("🎮 Fantasy: Expected Points & DRS Boost")
+
+    # Advanced settings (collapse by default)
+    with st.expander("Advanced settings", expanded=False):
+        pts_str = st.text_input(
+            "Finish points for P1..P10 (comma-sep)",
+            value="25,18,15,12,10,8,6,4,2,1",
+            help="Edit to match your fantasy scoring."
+        )
+        n_sims = st.slider("Number of simulations", 1000, 30000, 8000, step=1000)
+        seed   = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1)
+
+    # Defaults if expander stays closed
+    if "pts_str" not in locals(): pts_str = "25,18,15,12,10,8,6,4,2,1"
+    if "n_sims" not in locals(): n_sims = 8000
+    if "seed"   not in locals(): seed   = 42
+
+    # DRS: ×2 by default; ×3 automatically when Wildcard is active
+    wildcard = st.toggle("Wildcard active (DRS ×3)", value=False)
+    drs_mult = 3.0 if wildcard else 2.0
+
+    # Parse finish points safely
+    try:
+        FINISH_POINTS = np.array([float(x.strip()) for x in pts_str.split(",") if x.strip() != ""], dtype=float)
+    except Exception:
+        FINISH_POINTS = np.array([25,18,15,12,10,8,6,4,2,1], dtype=float)
+
+    # Run sims using your current table's win probabilities
+    win_vec = table_df["win_prob"].to_numpy(copy=True)
+    k_for_points = min(20, FINISH_POINTS.size)
+    order, exp_pos, pos_counts, pos_rate = simulate_topk_from_winprob(
+        win_vec, n_sims=int(n_sims), seed=int(seed), k=int(k_for_points)
+    )
+
+    # Expected finish points from position probabilities
+    P = pos_rate / 100.0
+    max_k = min(P.shape[1], FINISH_POINTS.size)
+    exp_finish_pts = (P[:, :max_k] * FINISH_POINTS[:max_k]).sum(axis=1)
+
+    fantasy_df = table_df.copy()
+    fantasy_df["exp_points"] = exp_finish_pts
+    fantasy_df["drs_gain"]   = (float(drs_mult) - 1.0) * fantasy_df["exp_points"]
+    fantasy_df = fantasy_df.sort_values(["exp_points","win_prob"], ascending=[False, False]).reset_index(drop=True)
+
+    from streamlit import column_config as _cc
+    st.dataframe(
+        fantasy_df[[c for c in ["driver","grid","grid_quali","win_pct","exp_points","drs_gain"] if c in fantasy_df.columns]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            **({"grid": _cc.NumberColumn("Grid", format="%d")} if "grid" in fantasy_df.columns else {}),
+            **({"grid_quali": _cc.NumberColumn("Quali", format="%d")} if "grid_quali" in fantasy_df.columns else {}),
+            "win_pct":     _cc.ProgressColumn("Win %",      min_value=0.0, max_value=100.0, format="%.1f%%"),
+            "exp_points":  _cc.NumberColumn("Exp. points",  format="%.2f"),
+            "drs_gain":    _cc.NumberColumn("DRS gain (Δ)", format="%.2f"),
+        }
+    )
+
+    # Recommendation callout
+    best_idx = int(np.argmax(fantasy_df["drs_gain"].to_numpy()))
+    best_row = fantasy_df.iloc[best_idx]
+    st.success(f"💡 DRS recommendation: **{best_row.get('driver','(unknown)')}** "
+            f"(+{best_row['drs_gain']:.2f} expected points at ×{drs_mult:.1f})")
+
+
+
 
     # === WHAT-IF CONTROLS (REPLACEMENT) ===
     # Big title you fully control
